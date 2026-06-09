@@ -1,82 +1,79 @@
 import { serveFile } from "jsr:@std/http/file-server";
+import { Pool } from "npm:pg";
 
-const kv = await Deno.openKv();
-// Set chunk size to 60KB to stay safely under the 64KB limit
-const CHUNK_SIZE = 60000; 
+// Deno Deploy automatically injects the SQL connection details in the background.
+// We just initialize the Pool and it connects instantly with zero configuration!
+const pool = new Pool();
+
+// Unlike KV, SQL databases need tables. We run this when the server starts
+// to ensure our "images" table exists before anyone tries to upload.
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS images (
+    id TEXT PRIMARY KEY,
+    data BYTEA,
+    content_type TEXT
+  );
+`);
 
 Deno.serve(async (req: Request) => {
   const url = new URL(req.url);
   const key = url.pathname.slice(1); // e.g., 'image.png'
 
-  // === CASE 1: Home Page (No filename) ===
+  // === CASE 1: Home Page ===
   if (!key || key === "") {
-    // Serve the index.html file directly from your project folder
     return serveFile(req, "./index.html");
   }
 
   // === CASE 2: Upload Image (PUT) ===
   if (req.method === 'PUT') {
+    // Read the file data in one piece (No chunking needed!)
     const data = new Uint8Array(await req.arrayBuffer());
     const contentType = req.headers.get('Content-Type') || 'application/octet-stream';
     
-    // Calculate how many 60KB chunks we need to make
-    const totalChunks = Math.ceil(data.length / CHUNK_SIZE);
-
     try {
-      // Save all chunks concurrently
-      const uploadPromises = [];
-      for (let i = 0; i < totalChunks; i++) {
-        const chunk = data.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
-        uploadPromises.push(kv.set(["images", key, "chunk", i], chunk));
-      }
-      await Promise.all(uploadPromises);
+      // Save the file into the Postgres database. 
+      // ON CONFLICT ensures that if an image with the same name exists, it gets overwritten.
+      await pool.query(
+        `INSERT INTO images (id, data, content_type) 
+         VALUES ($1, $2, $3) 
+         ON CONFLICT (id) DO UPDATE 
+         SET data = EXCLUDED.data, content_type = EXCLUDED.content_type`,
+        [key, data, contentType]
+      );
 
-      // Save metadata
-      await kv.set(["images", key, "meta"], { contentType, totalChunks });
-
-      return new Response('Saved successfully!', { status: 200 });
-    } catch (error) {
+      return new Response('Saved successfully to SQL!', { status: 200 });
+    } catch (error: any) {
       return new Response(`Failed to save: ${error.message}`, { status: 500 });
     }
   }
 
   // === CASE 3: View Image (GET) ===
   if (req.method === 'GET') {
-    const metaEntry = await kv.get(["images", key, "meta"]);
-    
-    // If it's not in the database, return a 404
-    if (!metaEntry.value) {
-      return new Response('Image not found', { status: 404 });
-    }
+    try {
+      // Look up the image by its ID
+      const result = await pool.query(
+        `SELECT data, content_type FROM images WHERE id = $1`, 
+        [key]
+      );
 
-    const { contentType, totalChunks } = metaEntry.value as any;
-
-    // Fetch all chunks concurrently
-    const chunkPromises = [];
-    for (let i = 0; i < totalChunks; i++) {
-      chunkPromises.push(kv.get(["images", key, "chunk", i]));
-    }
-    const chunkEntries = await Promise.all(chunkPromises);
-
-    // Reassemble the image chunks
-    const chunks = chunkEntries.map(entry => entry.value as Uint8Array);
-    const totalLength = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
-    const fullImage = new Uint8Array(totalLength);
-    
-    let offset = 0;
-    for (const chunk of chunks) {
-      if (chunk) {
-        fullImage.set(chunk, offset);
-        offset += chunk.length;
+      // If no rows were returned, the image doesn't exist
+      if (result.rows.length === 0) {
+        return new Response('Image not found', { status: 404 });
       }
-    }
 
-    return new Response(fullImage, {
-      headers: {
-        'Content-Type': contentType,
-        'Cache-Control': 'public, max-age=3600' 
-      }
-    });
+      // Grab the first (and only) matching row
+      const row = result.rows[0];
+      
+      // Serve the image back to the browser
+      return new Response(new Uint8Array(row.data), {
+        headers: {
+          'Content-Type': row.content_type,
+          'Cache-Control': 'public, max-age=3600' 
+        }
+      });
+    } catch (error: any) {
+       return new Response(`Error retrieving image: ${error.message}`, { status: 500 });
+    }
   }
 
   return new Response('Method not allowed', { status: 405 });
