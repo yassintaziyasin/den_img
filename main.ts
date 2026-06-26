@@ -1,80 +1,67 @@
-import { serveFile } from "jsr:@std/http/file-server";
-import { Pool } from "npm:pg";
-
-// Deno Deploy automatically injects the SQL connection details in the background.
-// We just initialize the Pool and it connects instantly with zero configuration!
-const pool = new Pool();
-
-// Unlike KV, SQL databases need tables. We run this when the server starts
-// to ensure our "images" table exists before anyone tries to upload.
-await pool.query(`
-  CREATE TABLE IF NOT EXISTS images (
-    id TEXT PRIMARY KEY,
-    data BYTEA,
-    content_type TEXT
-  );
-`);
-
-Deno.serve(async (req: Request) => {
-  const url = new URL(req.url);
-  const key = url.pathname.slice(1); // e.g., 'image.png'
-
-  // === CASE 1: Home Page ===
-  if (!key || key === "") {
-    return serveFile(req, "./index.html");
-  }
-
-  // === CASE 2: Upload Image (PUT) ===
-  if (req.method === 'PUT') {
-    // Read the file data in one piece (No chunking needed!)
-    const data = new Uint8Array(await req.arrayBuffer());
-    const contentType = req.headers.get('Content-Type') || 'application/octet-stream';
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Deno KV Image Uploader</title>
+  <link rel="stylesheet" href="https://demo-styles.deno.deno.net/styles.css">
+  <style>
+    main { text-align: center; margin-top: 50px; }
+    input[type="file"] { margin: 20px 0; }
+    #status { margin-top: 20px; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Deno SQL Uploader</h1>
+    <p>Select an image to upload.</p>
     
-    try {
-      // Save the file into the Postgres database. 
-      // ON CONFLICT ensures that if an image with the same name exists, it gets overwritten.
-      await pool.query(
-        `INSERT INTO images (id, data, content_type) 
-         VALUES ($1, $2, $3) 
-         ON CONFLICT (id) DO UPDATE 
-         SET data = EXCLUDED.data, content_type = EXCLUDED.content_type`,
-        [key, data, contentType]
-      );
+    <input type="file" id="fileInput" />
+    <br/>
+    <button onclick="upload()">Upload Image</button>
+    <div id="status"></div>
+  </main>
 
-      return new Response('Saved successfully to SQL!', { status: 200 });
-    } catch (error: any) {
-      return new Response(`Failed to save: ${error.message}`, { status: 500 });
-    }
-  }
-
-  // === CASE 3: View Image (GET) ===
-  if (req.method === 'GET') {
-    try {
-      // Look up the image by its ID
-      const result = await pool.query(
-        `SELECT data, content_type FROM images WHERE id = $1`, 
-        [key]
-      );
-
-      // If no rows were returned, the image doesn't exist
-      if (result.rows.length === 0) {
-        return new Response('Image not found', { status: 404 });
+  <script>
+    // --- NEW: Function to generate a random 10-character string ---
+    function generateRandomString(length) {
+      const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+      let result = '';
+      for (let i = 0; i < length; i++) {
+        result += chars.charAt(Math.floor(Math.random() * chars.length));
       }
-
-      // Grab the first (and only) matching row
-      const row = result.rows[0];
-      
-      // Serve the image back to the browser
-      return new Response(new Uint8Array(row.data), {
-        headers: {
-          'Content-Type': row.content_type,
-          'Cache-Control': 'public, max-age=3600' 
-        }
-      });
-    } catch (error: any) {
-       return new Response(`Error retrieving image: ${error.message}`, { status: 500 });
+      return result;
     }
-  }
 
-  return new Response('Method not allowed', { status: 405 });
-});
+    async function upload() {
+      const fileInput = document.getElementById('fileInput');
+      const file = fileInput.files[0];
+      if (!file) return alert('Please select a file');
+
+      // --- NEW: Create the new random file name ---
+      // 1. Get the original file extension (e.g., 'png' or 'jpg')
+      const extension = file.name.split('.').pop();
+      // 2. Combine the 10-character string with the extension
+      const randomFileName = generateRandomString(10) + '.' + extension;
+
+      document.getElementById('status').innerText = 'Uploading...';
+      
+      // --- UPDATED: Send to the new randomFileName instead of file.name ---
+      const response = await fetch('/' + randomFileName, {
+        method: 'PUT',
+        body: file,
+        headers: { 'Content-Type': file.type }
+      });
+
+      if (response.ok) {
+        // --- UPDATED: Show the link using the new randomFileName ---
+        document.getElementById('status').innerHTML = 
+          'Success! View image: <a href="/' + randomFileName + '" target="_blank">' + randomFileName + '</a>';
+      } else {
+        const errorText = await response.text();
+        document.getElementById('status').innerText = 'Error: ' + errorText;
+      }
+    }
+  </script>
+</body>
+</html>
